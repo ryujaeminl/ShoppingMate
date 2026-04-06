@@ -12,9 +12,9 @@ from ultralytics import YOLO
 # -----------------------------
 # API 키 (Render에서는 환경변수로 넣어)
 # -----------------------------
-SERPAPI_KEY = st.secrets["SERPAPI_KEY"]
-NAVER_ID = st.secrets["NAVER_CLIENT_ID"]
-NAVER_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+NAVER_ID = os.getenv("NAVER_CLIENT_ID")
+NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 
 # -----------------------------
 # YOLO 모델
