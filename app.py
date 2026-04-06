@@ -9,8 +9,8 @@ from PIL import Image, ImageOps
 # -----------------------------
 # API 키
 # -----------------------------
-SERPAPI_KEY = "여기에_serpapi_key".strip()
-IMGBB_API_KEY = "여기에_imgbb_key".strip()
+SERPAPI_KEY = "7a42ad207f06e9c06ab29fe54fd67b6f14c565c65ace73ba285aa7adaf011cfa"
+IMGBB_API_KEY = "475a4814c14a5d2be0f5775a85d1b450"
 
 # -----------------------------
 # 기본 설정
