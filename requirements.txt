@@ -1,6 +1,3 @@
 streamlit
 requests
-pillow
-pytesseract
-ultralytics
-opencv-python-headless
+beautifulsoup4
