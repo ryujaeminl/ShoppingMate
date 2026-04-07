@@ -1,7 +1,9 @@
 import os
 import re
 import base64
+import hashlib
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import streamlit as st
@@ -20,6 +22,11 @@ st.set_page_config(page_title="ShoppingMate", layout="centered")
 st.title("ShoppingMate")
 
 # -----------------------------
+# 세션
+# -----------------------------
+session = requests.Session()
+
+# -----------------------------
 # 유틸
 # -----------------------------
 def preprocess_image(image: Image.Image) -> Image.Image:
@@ -27,7 +34,19 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
-def center_crop_image(image: Image.Image, crop_ratio=0.7) -> Image.Image:
+def resize_for_search(image: Image.Image, max_side=1200) -> Image.Image:
+    width, height = image.size
+    max_current = max(width, height)
+
+    if max_current <= max_side:
+        return image
+
+    scale = max_side / max_current
+    new_size = (int(width * scale), int(height * scale))
+    return image.resize(new_size)
+
+
+def center_crop_image(image: Image.Image, crop_ratio=0.75) -> Image.Image:
     width, height = image.size
     new_width = int(width * crop_ratio)
     new_height = int(height * crop_ratio)
@@ -38,6 +57,12 @@ def center_crop_image(image: Image.Image, crop_ratio=0.7) -> Image.Image:
     bottom = top + new_height
 
     return image.crop((left, top, right, bottom))
+
+
+def image_to_hash(image: Image.Image) -> str:
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return hashlib.md5(buffer.getvalue()).hexdigest()
 
 
 def extract_price_number(price_value):
@@ -58,19 +83,16 @@ def extract_price_number(price_value):
         return 999999999
 
 
-def upload_to_imgbb(image: Image.Image) -> str:
-    buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=92)
-    img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-    response = requests.post(
+@st.cache_data(ttl=3600, show_spinner=False)
+def upload_image_b64_to_imgbb(img_b64: str) -> str:
+    response = session.post(
         "https://api.imgbb.com/1/upload",
         data={
             "key": IMGBB_API_KEY,
             "image": img_b64,
             "name": "photo"
         },
-        timeout=30
+        timeout=20
     )
 
     if response.status_code != 200:
@@ -82,6 +104,14 @@ def upload_to_imgbb(image: Image.Image) -> str:
         raise RuntimeError(f"ImgBB 업로드 실패: {data}")
 
     return data["data"]["url"]
+
+
+def upload_to_imgbb(image: Image.Image) -> str:
+    image = resize_for_search(image, max_side=1200)
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85, optimize=True)
+    img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return upload_image_b64_to_imgbb(img_b64)
 
 
 def clean_product_title(title: str) -> str:
@@ -97,33 +127,32 @@ def clean_product_title(title: str) -> str:
 
 
 def score_specificity(title: str) -> int:
-    """
-    제품명처럼 구체적일수록 높은 점수
-    """
     if not title:
         return -999
 
     score = 0
     length = len(title)
 
-    if length < 6:
+    if length < 5:
         return -999
 
-    score += min(length, 40)
+    score += min(length, 35)
 
     if re.search(r"\d", title):
-        score += 10
+        score += 12
+
     if re.search(r"\b(ml|l|oz|mm|cm|gb|tb|w|inch)\b", title.lower()):
-        score += 10
+        score += 12
+
     if re.search(r"[A-Z]{2,}\d*", title):
-        score += 6
+        score += 8
 
     generic_words = {
         "스타벅스", "삼성", "애플", "나이키", "텀블러", "컵",
         "신발", "가방", "상품", "물병", "마우스", "키보드"
     }
     if title in generic_words:
-        score -= 30
+        score -= 25
 
     return score
 
@@ -134,15 +163,41 @@ def normalize_words(text: str):
     stopwords = {
         "the", "and", "for", "with", "new", "best", "official",
         "상품", "정품", "국내", "해외", "무료", "배송", "판매", "구매",
-        "쇼핑", "스토어", "브랜드"
+        "쇼핑", "스토어", "브랜드", "옵션", "선택", "할인"
     }
     return [w for w in words if len(w) >= 2 and w not in stopwords]
 
 
+def extract_key_tokens(title: str):
+    lower = title.lower()
+
+    known_brands = [
+        "samsung", "apple", "nike", "adidas", "lg", "sony", "asus",
+        "logitech", "anker", "starbucks", "삼성", "애플", "나이키",
+        "아디다스", "엘지", "스타벅스", "로지텍"
+    ]
+    brands = set()
+    for brand in known_brands:
+        if brand in lower:
+            brands.add(brand)
+
+    model_tokens = set(re.findall(r"[a-zA-Z]{1,5}[-]?\d{2,}[a-zA-Z0-9-]*", title))
+    size_tokens = set(re.findall(r"\d+(?:\.\d+)?\s?(?:ml|l|oz|mm|cm|gb|tb|w|inch)", lower))
+    color_tokens = set(re.findall(r"(black|white|silver|blue|red|pink|green|gold|purple|gray|grey|블랙|화이트|실버|블루|레드|핑크|그린|골드|퍼플|그레이)", lower))
+
+    return {
+        "brands": brands,
+        "models": model_tokens,
+        "sizes": size_tokens,
+        "colors": color_tokens
+    }
+
+
 # -----------------------------
-# 1단계: 제품 탐지(넓게)
+# 1단계: 제품 탐지
 # -----------------------------
-def get_lens_product_candidates(image_url: str, max_candidates=6):
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_lens_product_candidates(image_url: str, max_candidates=4):
     params = {
         "engine": "google_lens",
         "url": image_url,
@@ -153,10 +208,10 @@ def get_lens_product_candidates(image_url: str, max_candidates=6):
         "output": "json"
     }
 
-    response = requests.get(
+    response = session.get(
         "https://serpapi.com/search.json",
         params=params,
-        timeout=60
+        timeout=30
     )
 
     if response.status_code != 200:
@@ -165,47 +220,56 @@ def get_lens_product_candidates(image_url: str, max_candidates=6):
     data = response.json()
     candidates = []
 
-    # products 먼저
     for item in data.get("products", []):
         title = clean_product_title(item.get("title", ""))
         if title:
             candidates.append(title)
 
-    # visual_matches도 같이 사용
     for item in data.get("visual_matches", []):
         title = clean_product_title(item.get("title", ""))
         if title:
             candidates.append(title)
 
-    # 중복 제거
     unique = []
+    seen = set()
     for title in candidates:
-        if title not in unique:
+        key = title.lower()
+        if key not in seen:
+            seen.add(key)
             unique.append(title)
 
     unique.sort(key=score_specificity, reverse=True)
     return unique[:max_candidates]
 
 
-def get_combined_candidates(original_image: Image.Image, cropped_image: Image.Image):
+def get_combined_candidates(original_image: Image.Image):
     original_url = upload_to_imgbb(original_image)
-    cropped_url = upload_to_imgbb(cropped_image)
+    original_candidates = get_lens_product_candidates(original_url, max_candidates=4)
 
-    original_candidates = get_lens_product_candidates(original_url, max_candidates=6)
-    cropped_candidates = get_lens_product_candidates(cropped_url, max_candidates=6)
+    # 원본 후보가 괜찮으면 crop 생략
+    if original_candidates and score_specificity(original_candidates[0]) >= 28:
+        return original_candidates[:3], "original_only"
+
+    cropped_image = center_crop_image(original_image, 0.75)
+    cropped_url = upload_to_imgbb(cropped_image)
+    cropped_candidates = get_lens_product_candidates(cropped_url, max_candidates=3)
 
     merged = []
+    seen = set()
     for title in original_candidates + cropped_candidates:
-        if title not in merged:
+        key = title.lower()
+        if key not in seen:
+            seen.add(key)
             merged.append(title)
 
     merged.sort(key=score_specificity, reverse=True)
-    return merged[:8]
+    return merged[:3], "original+crop"
 
 
 # -----------------------------
-# 2단계: 쇼핑 결과 가져오기
+# 2단계: 쇼핑 검색
 # -----------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
 def search_google_shopping(query: str):
     params = {
         "engine": "google_shopping",
@@ -216,10 +280,10 @@ def search_google_shopping(query: str):
         "no_cache": "true"
     }
 
-    response = requests.get(
+    response = session.get(
         "https://serpapi.com/search.json",
         params=params,
-        timeout=60
+        timeout=30
     )
 
     if response.status_code != 200:
@@ -244,7 +308,6 @@ def search_google_shopping(query: str):
             price_num = extract_price_number(price_raw)
             price_text = str(price_raw) if price_raw is not None else ""
 
-        # 가격 있는 쇼핑 결과만
         if not title or not link or price_num >= 999999999:
             continue
 
@@ -261,7 +324,7 @@ def search_google_shopping(query: str):
 
 
 # -----------------------------
-# 3단계: 후보와 결과의 유사도 측정
+# 3단계: 일치도 계산
 # -----------------------------
 def relevance_score(target_title: str, candidate_title: str) -> int:
     target_words = set(normalize_words(target_title))
@@ -270,14 +333,37 @@ def relevance_score(target_title: str, candidate_title: str) -> int:
     if not target_words or not candidate_words:
         return 0
 
-    common = target_words & candidate_words
-    score = len(common) * 10
+    common_words = target_words & candidate_words
+    score = len(common_words) * 8
 
-    # 숫자/모델명/용량 비슷하면 추가점수
+    t = extract_key_tokens(target_title)
+    c = extract_key_tokens(candidate_title)
+
+    brand_match = t["brands"] & c["brands"]
+    model_match = t["models"] & c["models"]
+    size_match = t["sizes"] & c["sizes"]
+    color_match = t["colors"] & c["colors"]
+
+    score += len(brand_match) * 25
+    score += len(model_match) * 40
+    score += len(size_match) * 20
+    score += len(color_match) * 8
+
+    # 숫자 토큰 보조
     target_nums = set(re.findall(r"[a-zA-Z]*\d+[a-zA-Z]*", target_title.lower()))
     cand_nums = set(re.findall(r"[a-zA-Z]*\d+[a-zA-Z]*", candidate_title.lower()))
     if target_nums and cand_nums:
-        score += len(target_nums & cand_nums) * 15
+        score += len(target_nums & cand_nums) * 10
+
+    # 불일치 패널티
+    if t["models"] and c["models"] and not model_match:
+        score -= 25
+
+    if t["sizes"] and c["sizes"] and not size_match:
+        score -= 18
+
+    if t["brands"] and c["brands"] and not brand_match:
+        score -= 20
 
     return score
 
@@ -291,78 +377,118 @@ def filter_relevant_results(target_title: str, results: list):
         new_item["match_score"] = score
         scored.append(new_item)
 
-    # 너무 관련 없는 결과 제거
-    filtered = [x for x in scored if x["match_score"] >= 10]
+    filtered = [x for x in scored if x["match_score"] >= 12]
 
-    # 하나도 없으면 상위 5개라도 유지
     if not filtered:
         scored.sort(key=lambda x: x["match_score"], reverse=True)
         filtered = scored[:5]
 
-    # 가장 똑같은 제품 우선, 그 다음 가격
     filtered.sort(key=lambda x: (-x["match_score"], x["price_num"]))
     return filtered
 
 
+def result_consistency_score(results: list) -> float:
+    if len(results) < 2:
+        return 0.0
+
+    titles = [set(normalize_words(x["title"])) for x in results[:3]]
+    if len(titles) < 2:
+        return 0.0
+
+    total = 0
+    count = 0
+    for i in range(len(titles)):
+        for j in range(i + 1, len(titles)):
+            inter = len(titles[i] & titles[j])
+            total += inter
+            count += 1
+
+    return total / count if count else 0.0
+
+
 # -----------------------------
-# 4단계: 후보 여러 개 중 "가장 똑같은 제품" 고르기
+# 4단계: 최적 후보 찾기
 # -----------------------------
-def find_best_product_results(original_image: Image.Image, cropped_image: Image.Image):
-    candidates = get_combined_candidates(original_image, cropped_image)
+def search_candidate_bundle(candidate: str):
+    shopping_results = search_google_shopping(candidate)
+    filtered_results = filter_relevant_results(candidate, shopping_results)
+
+    if not filtered_results:
+        return {
+            "candidate": candidate,
+            "results": [],
+            "top_match": 0,
+            "avg_match": 0,
+            "consistency": 0
+        }
+
+    top_match = filtered_results[0]["match_score"]
+    avg_match = sum(x["match_score"] for x in filtered_results[:3]) / min(len(filtered_results), 3)
+    consistency = result_consistency_score(filtered_results)
+
+    return {
+        "candidate": candidate,
+        "results": filtered_results,
+        "top_match": top_match,
+        "avg_match": avg_match,
+        "consistency": consistency
+    }
+
+
+def find_best_product_results(original_image: Image.Image):
+    candidates, mode = get_combined_candidates(original_image)
 
     if not candidates:
-        return None, [], []
+        return None, [], [], mode
 
     best_title = None
     best_results = []
-    best_top_match = -1
-    best_average = -1
+    best_score_tuple = (-999, -999, -999)
 
     all_candidate_logs = []
 
-    for candidate in candidates:
-        try:
-            shopping_results = search_google_shopping(candidate)
-            filtered_results = filter_relevant_results(candidate, shopping_results)
+    with ThreadPoolExecutor(max_workers=min(3, len(candidates))) as executor:
+        future_map = {
+            executor.submit(search_candidate_bundle, candidate): candidate
+            for candidate in candidates
+        }
 
-            if not filtered_results:
+        for future in as_completed(future_map):
+            candidate = future_map[future]
+            try:
+                bundle = future.result()
+                filtered_results = bundle["results"]
+                top_match = bundle["top_match"]
+                avg_match = bundle["avg_match"]
+                consistency = bundle["consistency"]
+
+                all_candidate_logs.append({
+                    "candidate": candidate,
+                    "top_match": top_match,
+                    "count": len(filtered_results),
+                    "consistency": round(consistency, 2)
+                })
+
+                current_tuple = (top_match, avg_match, consistency)
+
+                if current_tuple > best_score_tuple:
+                    best_score_tuple = current_tuple
+                    best_title = candidate
+                    best_results = filtered_results
+
+            except Exception:
                 all_candidate_logs.append({
                     "candidate": candidate,
                     "top_match": 0,
-                    "count": 0
+                    "count": 0,
+                    "consistency": 0
                 })
-                continue
-
-            top_match = filtered_results[0]["match_score"]
-            avg_match = sum(x["match_score"] for x in filtered_results[:3]) / min(len(filtered_results), 3)
-
-            all_candidate_logs.append({
-                "candidate": candidate,
-                "top_match": top_match,
-                "count": len(filtered_results)
-            })
-
-            # 가장 똑같은 것 우선
-            if (top_match > best_top_match) or (top_match == best_top_match and avg_match > best_average):
-                best_top_match = top_match
-                best_average = avg_match
-                best_title = candidate
-                best_results = filtered_results
-
-        except Exception:
-            all_candidate_logs.append({
-                "candidate": candidate,
-                "top_match": 0,
-                "count": 0
-            })
-            continue
 
     if not best_title:
-        return candidates[0], [], all_candidate_logs
+        return candidates[0], [], all_candidate_logs, mode
 
-    # 최종 출력은 최저가순
     best_results.sort(key=lambda x: x["price_num"])
-    return best_title, best_results, all_candidate_logs
+    return best_title, best_results, all_candidate_logs, mode
 
 
 # -----------------------------
@@ -378,7 +504,7 @@ elif uploaded_file is not None:
     query_image = Image.open(uploaded_file)
 
 if not SERPAPI_KEY or not IMGBB_API_KEY:
-    st.error("SERPAPI_KEY와 IMGBB_API_KEY를 코드에 넣어주세요.")
+    st.error("SERPAPI_KEY와 IMGBB_API_KEY를 환경변수에 넣어주세요.")
     st.stop()
 
 # -----------------------------
@@ -386,24 +512,22 @@ if not SERPAPI_KEY or not IMGBB_API_KEY:
 # -----------------------------
 if query_image is not None:
     query_image = preprocess_image(query_image)
-    cropped_image = center_crop_image(query_image, 0.7)
+    query_image = resize_for_search(query_image, max_side=1400)
 
     st.image(query_image, caption="원본 이미지", use_container_width=True)
 
-    with st.expander("검색에 사용할 중심 영역 보기"):
-        st.image(cropped_image, caption="중앙 crop 이미지", use_container_width=True)
+    with st.expander("검색 보조용 중심 영역 보기"):
+        cropped_preview = center_crop_image(query_image, 0.75)
+        st.image(cropped_preview, caption="중앙 crop 이미지", use_container_width=True)
 
     if st.button("같은 제품 찾기", use_container_width=True):
         with st.status("제품 탐지 및 쇼핑 검색 중...", expanded=True) as status:
             try:
-                status.write("1) 원본/중앙 영역 이미지 업로드 중...")
-                status.write("2) Lens로 제품 후보를 넓게 탐지 중...")
-                status.write("3) 각 후보를 쇼핑 검색 후 가장 똑같은 결과를 찾는 중...")
+                status.write("1) 이미지 전처리 및 업로드 준비 중...")
+                status.write("2) Lens로 제품 후보 탐지 중...")
+                status.write("3) 후보별 쇼핑 검색 및 비교 중...")
 
-                best_title, shopping_results, candidate_logs = find_best_product_results(
-                    query_image,
-                    cropped_image
-                )
+                best_title, shopping_results, candidate_logs, mode = find_best_product_results(query_image)
 
                 if not best_title:
                     status.update(label="제품명을 찾지 못했습니다.", state="error")
@@ -414,6 +538,7 @@ if query_image is not None:
                     st.info(f"탐지된 대표 후보: {best_title}")
                 else:
                     status.write(f"선택된 대표 제품명: **{best_title}**")
+                    status.write(f"검색 방식: **{mode}**")
                     status.update(label="검색 완료", state="complete")
 
                     st.subheader("탐지된 제품")
@@ -443,10 +568,11 @@ if query_image is not None:
 
                             st.divider()
 
-                    with st.expander("탐지 후보 비교 보기"):
-                        for log in candidate_logs:
+                    with st.expander("후보 비교 보기"):
+                        for log in sorted(candidate_logs, key=lambda x: x["top_match"], reverse=True):
                             st.write(
-                                f"- {log['candidate']} | 최고 일치도: {log['top_match']} | 결과 수: {log['count']}"
+                                f"- {log['candidate']} | 최고 일치도: {log['top_match']} | "
+                                f"결과 수: {log['count']} | 일관성: {log['consistency']}"
                             )
 
             except Exception as e:
