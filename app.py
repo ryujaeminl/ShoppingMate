@@ -16,9 +16,8 @@ IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")
 # -----------------------------
 # 기본 설정
 # -----------------------------
-st.set_page_config(page_title="사진으로 같은 제품 찾기", layout="centered")
-st.title("📷 사진으로 같은 제품 찾기")
-st.write("제품은 넓게 탐지하고, 최종 결과는 가장 똑같은 쇼핑 상품만 보여줍니다.")
+st.set_page_config(page_title="ShoppingMate", layout="centered")
+st.title("ShoppingMate")
 
 # -----------------------------
 # 유틸
@@ -417,7 +416,7 @@ if query_image is not None:
                     status.write(f"선택된 대표 제품명: **{best_title}**")
                     status.update(label="검색 완료", state="complete")
 
-                    st.subheader("🧠 탐지된 제품")
+                    st.subheader("탐지된 제품")
                     st.info(f"이 사진은 **{best_title}** 와(과) 가장 가깝습니다.")
 
                     st.subheader("🛒 가장 똑같은 쇼핑 결과")
